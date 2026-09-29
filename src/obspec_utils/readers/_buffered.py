@@ -91,12 +91,12 @@ class BufferedStoreReader:
     @property
     def e_tag(self) -> str | None:
         """
-        The object's ETag, as observed before or with the reader's first data read.
+        The object's ETag from the reader's first request, a HEAD.
 
-        `None` until the reader has read something, or if the store reports no
-        ETag. Never looked up after the fact: an ETag fetched later could describe
-        a newer revision than the bytes already read. Reads are not checked
-        against it.
+        `None` until that request (any read or `seek` relative to the end), or if
+        the store reports no ETag. Never refreshed: an ETag fetched later could
+        describe a newer revision than the bytes already read. Reads are not
+        checked against it.
         """
         return self._e_tag
 
@@ -163,10 +163,11 @@ class BufferedStoreReader:
         bytes
             The complete file contents.
         """
+        # HEAD first: the ETag is only trusted from the store's own head(). A
+        # get() through a caching/splitting wrapper carries the wrapper's metadata.
+        self._get_size()
         result = self._store.get(self._path)
         data = bytes(result.buffer())
-        if self._size is None:
-            self._e_tag = result.meta.get("e_tag")
         self._size = len(data)
         self._position = len(data)
         return data

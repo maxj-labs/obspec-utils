@@ -121,8 +121,6 @@ class EagerStoreReader:
         if num_requests == 1:
             result = store.get(path)
             data = bytes(result.buffer())
-            if self._e_tag is None:
-                self._e_tag = result.meta.get("e_tag")
         else:
             # Concurrent range requests
             starts = []
@@ -144,12 +142,11 @@ class EagerStoreReader:
     @property
     def e_tag(self) -> str | None:
         """
-        The object's ETag, as observed before or with the file's download.
+        The object's ETag from the HEAD made before the download.
 
-        `None` if the store reports no ETag, or if `file_size` was passed and the
-        file was fetched as several range requests (which carry no metadata).
-        Never looked up after the fact: an ETag fetched later could describe a
-        newer revision than the bytes already read. Reads are not checked
+        `None` if `file_size` was passed (no HEAD is made) or the store reports
+        no ETag. Never refreshed: an ETag fetched later could describe a newer
+        revision than the bytes already read. The download is not checked
         against it.
         """
         return self._e_tag

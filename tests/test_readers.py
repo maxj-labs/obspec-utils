@@ -16,9 +16,9 @@ from obspec_utils.readers import (
     EagerStoreReader,
     ParallelStoreReader,
 )
+from obspec_utils.wrappers import CachingReadableStore, SplittingReadableStore
 
 from .mocks import MockReadableStore, PicklableStore
-
 
 ALL_READERS = [BufferedStoreReader, EagerStoreReader, BlockStoreReader]
 
@@ -631,9 +631,9 @@ def test_reader_writable(ReaderClass):
 
 
 @pytest.mark.parametrize("ReaderClass", ALL_READERS)
-def test_reader_e_tag_is_observed_with_the_first_read(ReaderClass):
-    """The ETag matches the revision the reader read, and is never refreshed
-    afterwards: a later lookup could describe bytes the reader never saw."""
+def test_reader_e_tag_is_observed_with_the_first_request(ReaderClass):
+    """The ETag comes from the reader's first request and is never refreshed:
+    a later lookup could describe bytes the reader never saw."""
     memstore = MemoryStore()
     memstore.put("test.txt", b"hello world")
     original = memstore.head("test.txt")["e_tag"]
@@ -642,40 +642,40 @@ def test_reader_e_tag_is_observed_with_the_first_read(ReaderClass):
     reader.read(5)
     memstore.put("test.txt", b"HELLO WORLD")
 
+    assert memstore.head("test.txt")["e_tag"] != original
     assert reader.e_tag == original
     reader.close()
 
 
 @pytest.mark.parametrize("ReaderClass", [BufferedStoreReader, BlockStoreReader])
-def test_lazy_reader_e_tag_is_none_before_any_read(ReaderClass):
+def test_lazy_reader_e_tag_is_none_before_any_request(ReaderClass):
     memstore = MemoryStore()
     memstore.put("test.txt", b"hello world")
 
     assert ReaderClass(memstore, "test.txt").e_tag is None
 
 
-@pytest.mark.parametrize("ReaderClass", [BufferedStoreReader, BlockStoreReader])
-def test_reader_e_tag_from_readall_without_head(ReaderClass):
-    """readall() is a single GET, so its metadata carries the ETag."""
+@pytest.mark.parametrize("ReaderClass", ALL_READERS)
+@pytest.mark.parametrize("Wrapper", [CachingReadableStore, SplittingReadableStore])
+def test_reader_e_tag_through_wrapper_is_the_origin_e_tag(ReaderClass, Wrapper):
+    """The wrappers serve get() from an internal MemoryStore whose metadata is
+    not the origin's; only head() reaches the origin."""
     memstore = MemoryStore()
-    memstore.put("test.txt", b"hello world")
-
-    reader = ReaderClass(memstore, "test.txt")
-    reader.readall()
-
-    assert reader.e_tag == memstore.head("test.txt")["e_tag"]
-
-
-def test_eager_reader_e_tag_without_head():
-    """With file_size given there is no HEAD: a single GET still carries the
-    ETag, several range requests do not."""
-    memstore = MemoryStore()
+    memstore.put("test.txt", b"stale")
     memstore.put("test.txt", b"hello world")
     e_tag = memstore.head("test.txt")["e_tag"]
 
-    assert EagerStoreReader(memstore, "test.txt", file_size=11).e_tag == e_tag
-    split = EagerStoreReader(memstore, "test.txt", request_size=4, file_size=11)
-    assert split.e_tag is None
+    reader = ReaderClass(Wrapper(memstore), "test.txt")
+    assert reader.readall() == b"hello world"
+    assert reader.e_tag == e_tag
+
+
+def test_eager_reader_e_tag_none_when_file_size_given():
+    """With file_size given there is no HEAD, so no ETag is observed."""
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+
+    assert EagerStoreReader(memstore, "test.txt", file_size=11).e_tag is None
 
 
 @pytest.mark.parametrize("ReaderClass", ALL_READERS)
