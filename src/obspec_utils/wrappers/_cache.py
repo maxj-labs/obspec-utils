@@ -11,6 +11,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from obspec.exceptions import PreconditionError
 from obstore.store import MemoryStore
 
 from obspec_utils.protocols import ReadableStore
@@ -99,6 +100,8 @@ class CachingReadableStore(ReadableStore):
         self._max_size = max_size
         self._current_size = 0
         self._path_sizes: OrderedDict[str, int] = OrderedDict()
+        # ETag the origin reported for each cached copy, for If-Match
+        self._e_tags: dict[str, str | None] = {}
         self._lock = threading.Lock()
 
     def __getattr__(self, name: str) -> Any:
@@ -133,7 +136,7 @@ class CachingReadableStore(ReadableStore):
             (self._store, self._max_size),
         )
 
-    def _add_to_cache(self, path: str, data: bytes) -> None:
+    def _add_to_cache(self, path: str, data: bytes, e_tag: str | None) -> None:
         """Add data to cache, evicting LRU entries if needed.
 
         Must be called with self._lock held.
@@ -144,11 +147,13 @@ class CachingReadableStore(ReadableStore):
         while self._current_size + size > self._max_size and self._path_sizes:
             oldest_path, oldest_size = self._path_sizes.popitem(last=False)
             self._cache.delete(oldest_path)
+            self._e_tags.pop(oldest_path, None)
             self._current_size -= oldest_size
 
         # Add to cache
         self._cache.put(path, data)
         self._path_sizes[path] = size
+        self._e_tags[path] = e_tag
         self._current_size += size
 
     def _ensure_cached(self, path: str) -> None:
@@ -163,7 +168,7 @@ class CachingReadableStore(ReadableStore):
             # Cache miss - fetch and cache
             result = self._store.get(path)
             data = bytes(result.buffer())
-            self._add_to_cache(path, data)
+            self._add_to_cache(path, data, result.meta.get("e_tag"))
 
     async def _ensure_cached_async(self, path: str) -> None:
         """Async version of _ensure_cached.
@@ -183,7 +188,7 @@ class CachingReadableStore(ReadableStore):
         with self._lock:
             # Check again in case another coroutine cached it
             if path not in self._path_sizes:
-                self._add_to_cache(path, data)
+                self._add_to_cache(path, data, result.meta.get("e_tag"))
             else:
                 self._path_sizes.move_to_end(path)
 
@@ -192,6 +197,7 @@ class CachingReadableStore(ReadableStore):
         with self._lock:
             self._cache = MemoryStore()
             self._path_sizes.clear()
+            self._e_tags.clear()
             self._current_size = 0
 
     @property
@@ -216,10 +222,33 @@ class CachingReadableStore(ReadableStore):
 
     # Implement ReadableStore protocol
 
+    def _check_if_match(
+        self, path: str, options: GetOptions | None
+    ) -> GetOptions | None:
+        """Apply an `if_match` option against the cached copy's origin ETag.
+
+        Must be called with self._lock held and the path cached. The internal
+        MemoryStore has its own ETags, so the condition cannot be delegated to it.
+        """
+        if not options or options.get("if_match") is None:
+            return options
+        if options["if_match"] != self._e_tags[path]:
+            raise PreconditionError(
+                f"cached copy of {path!r} has ETag {self._e_tags[path]!r}, "
+                f"not {options['if_match']!r}"
+            )
+        return {k: v for k, v in options.items() if k != "if_match"}  # type: ignore[return-value]
+
     def get(self, path: str, *, options: GetOptions | None = None) -> GetResult:
-        """Get entire file, using cache if available."""
+        """Get entire file, using cache if available.
+
+        Of the [GetOptions][obspec.GetOptions], `range` is served from the cache
+        and `if_match` is checked against the ETag the origin reported when the
+        copy was cached.
+        """
         with self._lock:
             self._ensure_cached(path)
+            options = self._check_if_match(path, options)
         return self._cache.get(path, options=options)
 
     async def get_async(
@@ -227,6 +256,8 @@ class CachingReadableStore(ReadableStore):
     ) -> GetResultAsync:
         """Get entire file async, using cache if available."""
         await self._ensure_cached_async(path)
+        with self._lock:
+            options = self._check_if_match(path, options)
         return await self._cache.get_async(path, options=options)
 
     def get_range(

@@ -5,6 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from obspec.exceptions import PreconditionError
 from obstore.store import MemoryStore
 
 from obspec_utils.wrappers import CachingReadableStore
@@ -119,6 +120,26 @@ class TestCachingReadableStore:
                 raise ValueError("test error")
 
         assert cached.cache_size == 0
+
+    def test_if_match_is_checked_against_the_origin_etag(self):
+        """The cache's MemoryStore has its own ETags; if_match must be judged by
+        the ETag the origin reported for the cached copy."""
+        source = MemoryStore()
+        source.put("file.txt", b"stale")
+        source.put("file.txt", b"hello world")
+        e_tag = source.head("file.txt")["e_tag"]
+        cached = CachingReadableStore(source)
+
+        result = cached.get("file.txt", options={"if_match": e_tag, "range": (0, 5)})
+        assert bytes(result.buffer()) == b"hello"
+
+        source.put("file.txt", b"HELLO WORLD")
+        with pytest.raises(PreconditionError):
+            cached.get(
+                "file.txt", options={"if_match": source.head("file.txt")["e_tag"]}
+            )
+        # The cached copy still matches the ETag it was fetched with
+        assert bytes(cached.get("file.txt", options={"if_match": e_tag}).buffer())
 
 
 class TestLRUEviction:
