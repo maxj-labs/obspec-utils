@@ -8,6 +8,7 @@ import warnings
 from io import BytesIO
 
 import pytest
+from obspec.exceptions import PreconditionError as ObspecPreconditionError
 from obstore.exceptions import PreconditionError
 from obstore.store import MemoryStore, LocalStore
 
@@ -691,6 +692,9 @@ def test_reader_e_tag_none_when_store_reports_none(ReaderClass):
 # pin_etag
 # =============================================================================
 
+# obstore stores raise obstore's PreconditionError, obspec-utils' own raise obspec's
+PRECONDITION = (PreconditionError, ObspecPreconditionError)
+
 
 class _OverwrittenAfterHead:
     """Delegates to a MemoryStore, overwriting the object right after the
@@ -709,6 +713,11 @@ class _OverwrittenAfterHead:
 
     def __getattr__(self, name):
         return getattr(self._store, name)
+
+
+class _WeakETagStore(MockReadableStore):
+    def head(self, path):
+        return {**super().head(path), "e_tag": 'W/"abc"'}
 
 
 PINNABLE = [
@@ -739,8 +748,17 @@ def test_pinned_reader_fails_when_object_changes_after_head(ReaderClass, kwargs)
     memstore.put("test.txt", b"hello world")
     store = _OverwrittenAfterHead(memstore, "test.txt", b"HELLO WORLD")
 
-    with pytest.raises(PreconditionError):
+    with pytest.raises(PRECONDITION):
         ReaderClass(store, "test.txt", pin_etag=True, **kwargs).read(5)
+
+
+def test_pinned_eager_single_request_fails_when_object_changes_after_head():
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+    store = _OverwrittenAfterHead(memstore, "test.txt", b"HELLO WORLD")
+
+    with pytest.raises(PRECONDITION):
+        EagerStoreReader(store, "test.txt", pin_etag=True)
 
 
 @pytest.mark.parametrize("ReaderClass,kwargs", PINNABLE[:2])
@@ -749,7 +767,7 @@ def test_pinned_readall_fails_when_object_changes_after_head(ReaderClass, kwargs
     memstore.put("test.txt", b"hello world")
     store = _OverwrittenAfterHead(memstore, "test.txt", b"HELLO WORLD")
 
-    with pytest.raises(PreconditionError):
+    with pytest.raises(PRECONDITION):
         ReaderClass(store, "test.txt", pin_etag=True, **kwargs).readall()
 
 
@@ -767,8 +785,42 @@ def test_unpinned_reader_silently_reads_the_new_revision(ReaderClass, kwargs):
 
 
 @pytest.mark.parametrize("ReaderClass,kwargs", PINNABLE)
-def test_pinned_reader_requires_an_e_tag(ReaderClass, kwargs):
+def test_pinned_reader_requires_a_strong_e_tag(ReaderClass, kwargs):
     with pytest.raises(ValueError, match="no ETag"):
         ReaderClass(
             MockReadableStore(b"hello world"), "test.txt", pin_etag=True, **kwargs
         ).read(5)
+    with pytest.raises(ValueError, match="weak ETag"):
+        ReaderClass(
+            _WeakETagStore(b"hello world"), "test.txt", pin_etag=True, **kwargs
+        ).read(5)
+
+
+@pytest.mark.parametrize("ReaderClass,kwargs", PINNABLE)
+@pytest.mark.parametrize("Wrapper", [CachingReadableStore, SplittingReadableStore])
+def test_pinned_reader_through_wrapper(ReaderClass, kwargs, Wrapper):
+    """Pinned range reads are get() calls with a range: the wrappers must honor
+    the options rather than return the whole object or the cache's ETag."""
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"stale")
+    data = bytes(range(256)) * 8
+    memstore.put("test.txt", data)
+    store = Wrapper(
+        memstore, **({"request_size": 64} if Wrapper is SplittingReadableStore else {})
+    )
+
+    reader = ReaderClass(store, "test.txt", pin_etag=True, **kwargs)
+    reader.seek(1000)
+    assert reader.read(4) == data[1000:1004]
+    assert reader.e_tag == memstore.head("test.txt")["e_tag"]
+
+
+def test_pinned_reader_over_stale_cache_fails():
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+    cache = CachingReadableStore(memstore)
+    cache.get("test.txt")
+    memstore.put("test.txt", b"HELLO WORLD")
+
+    with pytest.raises(PRECONDITION):
+        BlockStoreReader(cache, "test.txt", pin_etag=True).read(5)

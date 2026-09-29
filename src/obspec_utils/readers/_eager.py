@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import io
-from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Protocol
 
 from obspec import Get, GetRanges, Head
 
-from obspec_utils.readers._if_match import get_ranges_if_match, require_e_tag
+from obspec_utils.readers._if_match import PinnedStore, head_pinnable
 
 
 class EagerStoreReader:
@@ -99,13 +98,16 @@ class EagerStoreReader:
             fit within this limit.
         pin_etag
             Send every request with If-Match against the ETag from a HEAD (made
-            even when `file_size` is given), so all bytes come from one revision
-            of the object and a modification mid-download raises the store's
-            precondition error (e.g. `obstore.exceptions.PreconditionError`)
-            instead of mixing revisions. Raises `ValueError` if the store
-            reports no ETag. Parts are then fetched with concurrent
-            [`get()`][obspec.Get] calls, since [`get_ranges()`][obspec.GetRanges]
-            takes no options.
+            even when `file_size` is given, whose value is then ignored), so all
+            bytes come from one revision of the object and a modification
+            mid-download raises the store's precondition error
+            (`obstore.exceptions.PreconditionError` for obstore stores,
+            `obspec.exceptions.PreconditionError` for obspec-utils' own) instead
+            of mixing revisions. Raises `ValueError` if the store reports no
+            ETag or a weak one. Only as strong as the store: a server that
+            ignores If-Match reads as if unpinned. Parts are then fetched with
+            concurrent [`get()`][obspec.Get] calls, since
+            [`get_ranges()`][obspec.GetRanges] takes no options.
         """
         self._store = store
         self._path = path
@@ -114,7 +116,8 @@ class EagerStoreReader:
 
         # Determine file size if not provided
         if pin_etag:
-            file_size, self._e_tag = require_e_tag(store, path)
+            file_size, self._e_tag = head_pinnable(store, path)
+            store = PinnedStore(store, path, self._e_tag, max_concurrent_requests)
         elif file_size is None:
             meta = store.head(path)
             file_size = meta["size"]
@@ -135,8 +138,7 @@ class EagerStoreReader:
 
         # Skip concurrency overhead for single request
         if num_requests == 1:
-            options = {"if_match": self._e_tag} if pin_etag else {}
-            result = store.get(path, options=options)  # type: ignore[arg-type]
+            result = store.get(path)
             data = bytes(result.buffer())
         else:
             # Concurrent range requests
@@ -149,19 +151,7 @@ class EagerStoreReader:
                 lengths.append(length)
 
             # Fetch all parts with concurrency
-            results: Sequence[Any]  # bytes, or the store's Buffer type
-            if pin_etag:
-                assert self._e_tag is not None  # set by require_e_tag()
-                results = get_ranges_if_match(
-                    store,
-                    path,
-                    starts=starts,
-                    lengths=lengths,
-                    e_tag=self._e_tag,
-                    max_workers=num_requests,
-                )
-            else:
-                results = store.get_ranges(path, starts=starts, lengths=lengths)
+            results = store.get_ranges(path, starts=starts, lengths=lengths)
 
             # Concatenate into single buffer
             data = b"".join(bytes(part) for part in results)

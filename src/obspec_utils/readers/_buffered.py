@@ -6,7 +6,7 @@ from typing import Protocol
 
 from obspec import Get, GetRange, Head
 
-from obspec_utils.readers._if_match import get_ranges_if_match, require_e_tag
+from obspec_utils.readers._if_match import PinnedStore, head_pinnable
 
 
 class BufferedStoreReader:
@@ -75,10 +75,13 @@ class BufferedStoreReader:
         pin_etag
             Send every read with If-Match against the ETag from the reader's
             initial HEAD, so all bytes come from one revision of the object and
-            a modification mid-read raises the store's precondition error (e.g.
-            `obstore.exceptions.PreconditionError`) instead of mixing revisions.
-            Raises `ValueError` if the store reports no ETag. Range reads then
-            go through [`get()`][obspec.Get], since
+            a modification mid-read raises the store's precondition error
+            (`obstore.exceptions.PreconditionError` for obstore stores,
+            `obspec.exceptions.PreconditionError` for obspec-utils' own) instead
+            of mixing revisions. Raises `ValueError` if the store reports no
+            ETag or a weak one. Only as strong as the store: a server that
+            ignores If-Match reads as if unpinned. Range reads then go through
+            [`get()`][obspec.Get] (several at a time on a thread pool), since
             [`get_range()`][obspec.GetRange] takes no options.
         """
         self._store = store
@@ -97,7 +100,9 @@ class BufferedStoreReader:
         """Lazily fetch the file size (and ETag) via a head() call."""
         if self._size is None:
             if self._pin_etag:
-                self._size, self._e_tag = require_e_tag(self._store, self._path)
+                self._size, e_tag = head_pinnable(self._store, self._path)
+                self._e_tag = e_tag
+                self._store = PinnedStore(self._store, self._path, e_tag)
             else:
                 meta = self._store.head(self._path)
                 self._size = meta["size"]
@@ -157,21 +162,9 @@ class BufferedStoreReader:
         # Need to fetch from store - clamp to remaining bytes
         remaining = file_size - self._position
         fetch_size = min(max(size, self._buffer_size), remaining)
-        if self._pin_etag:
-            assert self._e_tag is not None  # set by _get_size()
-            (data,) = get_ranges_if_match(
-                self._store,
-                self._path,
-                starts=[self._position],
-                lengths=[fetch_size],
-                e_tag=self._e_tag,
-            )
-        else:
-            data = bytes(
-                self._store.get_range(
-                    self._path, start=self._position, length=fetch_size
-                )
-            )
+        data = bytes(
+            self._store.get_range(self._path, start=self._position, length=fetch_size)
+        )
 
         # Update buffer
         self._buffer = data
@@ -194,10 +187,7 @@ class BufferedStoreReader:
         # HEAD first: the ETag is only trusted from the store's own head(). A
         # get() through a caching/splitting wrapper carries the wrapper's metadata.
         self._get_size()
-        if self._pin_etag:
-            result = self._store.get(self._path, options={"if_match": self._e_tag})
-        else:
-            result = self._store.get(self._path)
+        result = self._store.get(self._path)
         data = bytes(result.buffer())
         self._size = len(data)
         self._position = len(data)
