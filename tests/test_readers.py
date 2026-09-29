@@ -8,6 +8,7 @@ import warnings
 from io import BytesIO
 
 import pytest
+from obstore.exceptions import PreconditionError
 from obstore.store import MemoryStore, LocalStore
 
 from obspec_utils.readers import (
@@ -684,3 +685,90 @@ def test_reader_e_tag_none_when_store_reports_none(ReaderClass):
     reader.read(5)
 
     assert reader.e_tag is None
+
+
+# =============================================================================
+# pin_etag
+# =============================================================================
+
+
+class _OverwrittenAfterHead:
+    """Delegates to a MemoryStore, overwriting the object right after the
+    first HEAD: the window between a reader learning the ETag and reading."""
+
+    def __init__(self, store: MemoryStore, path: str, new: bytes):
+        self._store, self._path, self._new = store, path, new
+        self._done = False
+
+    def head(self, path):
+        meta = self._store.head(path)
+        if not self._done:
+            self._done = True
+            self._store.put(self._path, self._new)
+        return meta
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+
+PINNABLE = [
+    (BufferedStoreReader, {"buffer_size": 4}),
+    (BlockStoreReader, {"block_size": 4}),
+    (EagerStoreReader, {"request_size": 4}),
+]
+
+
+@pytest.mark.parametrize("ReaderClass,kwargs", PINNABLE)
+def test_pinned_reader_reads_normally(ReaderClass, kwargs):
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+
+    reader = ReaderClass(memstore, "test.txt", pin_etag=True, **kwargs)
+
+    assert reader.read(5) == b"hello"
+    reader.seek(6)
+    assert reader.read() == b"world"
+    reader.seek(0)
+    assert reader.readall() == b"hello world"
+    assert reader.e_tag == memstore.head("test.txt")["e_tag"]
+
+
+@pytest.mark.parametrize("ReaderClass,kwargs", PINNABLE)
+def test_pinned_reader_fails_when_object_changes_after_head(ReaderClass, kwargs):
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+    store = _OverwrittenAfterHead(memstore, "test.txt", b"HELLO WORLD")
+
+    with pytest.raises(PreconditionError):
+        ReaderClass(store, "test.txt", pin_etag=True, **kwargs).read(5)
+
+
+@pytest.mark.parametrize("ReaderClass,kwargs", PINNABLE[:2])
+def test_pinned_readall_fails_when_object_changes_after_head(ReaderClass, kwargs):
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+    store = _OverwrittenAfterHead(memstore, "test.txt", b"HELLO WORLD")
+
+    with pytest.raises(PreconditionError):
+        ReaderClass(store, "test.txt", pin_etag=True, **kwargs).readall()
+
+
+@pytest.mark.parametrize("ReaderClass,kwargs", PINNABLE[:2])
+def test_unpinned_reader_silently_reads_the_new_revision(ReaderClass, kwargs):
+    """Why pinning exists: without it, the bytes no longer match the ETag."""
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+    store = _OverwrittenAfterHead(memstore, "test.txt", b"HELLO WORLD")
+
+    reader = ReaderClass(store, "test.txt", **kwargs)
+
+    assert reader.read(5) == b"HELLO"
+    assert reader.e_tag != memstore.head("test.txt")["e_tag"]
+
+
+@pytest.mark.parametrize("ReaderClass,kwargs", PINNABLE)
+def test_pinned_reader_requires_an_e_tag(ReaderClass, kwargs):
+    with pytest.raises(ValueError, match="no ETag"):
+        ReaderClass(
+            MockReadableStore(b"hello world"), "test.txt", pin_etag=True, **kwargs
+        ).read(5)

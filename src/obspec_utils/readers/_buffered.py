@@ -6,6 +6,8 @@ from typing import Protocol
 
 from obspec import Get, GetRange, Head
 
+from obspec_utils.readers._if_match import get_ranges_if_match, require_e_tag
+
 
 class BufferedStoreReader:
     """
@@ -55,6 +57,8 @@ class BufferedStoreReader:
         store: BufferedStoreReader.Store,
         path: str,
         buffer_size: int = 1024 * 1024,
+        *,
+        pin_etag: bool = False,
     ) -> None:
         """
         Create a file-like reader for any object store.
@@ -68,6 +72,14 @@ class BufferedStoreReader:
         buffer_size
             Read-ahead buffer size in bytes. When reading, up to this many bytes
             may be fetched ahead to reduce the number of requests.
+        pin_etag
+            Send every read with If-Match against the ETag from the reader's
+            initial HEAD, so all bytes come from one revision of the object and
+            a modification mid-read raises the store's precondition error (e.g.
+            `obstore.exceptions.PreconditionError`) instead of mixing revisions.
+            Raises `ValueError` if the store reports no ETag. Range reads then
+            go through [`get()`][obspec.Get], since
+            [`get_range()`][obspec.GetRange] takes no options.
         """
         self._store = store
         self._path = path
@@ -75,6 +87,7 @@ class BufferedStoreReader:
         self._position = 0
         self._size: int | None = None
         self._e_tag: str | None = None
+        self._pin_etag = pin_etag
         self._closed = False
         # Read-ahead buffer
         self._buffer = b""
@@ -83,9 +96,12 @@ class BufferedStoreReader:
     def _get_size(self) -> int:
         """Lazily fetch the file size (and ETag) via a head() call."""
         if self._size is None:
-            meta = self._store.head(self._path)
-            self._size = meta["size"]
-            self._e_tag = meta.get("e_tag")
+            if self._pin_etag:
+                self._size, self._e_tag = require_e_tag(self._store, self._path)
+            else:
+                meta = self._store.head(self._path)
+                self._size = meta["size"]
+                self._e_tag = meta.get("e_tag")
         return self._size
 
     @property
@@ -95,8 +111,8 @@ class BufferedStoreReader:
 
         `None` until the reader has read something, or if the store reports no
         ETag. Never looked up after the fact: an ETag fetched later could describe
-        a newer revision than the bytes already read. Reads are not checked
-        against it.
+        a newer revision than the bytes already read. Reads are checked against
+        it only with `pin_etag=True`.
         """
         return self._e_tag
 
@@ -141,9 +157,21 @@ class BufferedStoreReader:
         # Need to fetch from store - clamp to remaining bytes
         remaining = file_size - self._position
         fetch_size = min(max(size, self._buffer_size), remaining)
-        data = bytes(
-            self._store.get_range(self._path, start=self._position, length=fetch_size)
-        )
+        if self._pin_etag:
+            assert self._e_tag is not None  # set by _get_size()
+            (data,) = get_ranges_if_match(
+                self._store,
+                self._path,
+                starts=[self._position],
+                lengths=[fetch_size],
+                e_tag=self._e_tag,
+            )
+        else:
+            data = bytes(
+                self._store.get_range(
+                    self._path, start=self._position, length=fetch_size
+                )
+            )
 
         # Update buffer
         self._buffer = data
@@ -163,7 +191,11 @@ class BufferedStoreReader:
         bytes
             The complete file contents.
         """
-        result = self._store.get(self._path)
+        if self._pin_etag:
+            self._get_size()
+            result = self._store.get(self._path, options={"if_match": self._e_tag})
+        else:
+            result = self._store.get(self._path)
         data = bytes(result.buffer())
         if self._size is None:
             self._e_tag = result.meta.get("e_tag")

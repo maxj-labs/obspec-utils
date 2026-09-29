@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import io
-from typing import Protocol
+from collections.abc import Sequence
+from typing import Any, Protocol
 
 from obspec import Get, GetRanges, Head
+
+from obspec_utils.readers._if_match import get_ranges_if_match, require_e_tag
 
 
 class EagerStoreReader:
@@ -67,6 +70,8 @@ class EagerStoreReader:
         request_size: int = 12 * 1024 * 1024,
         file_size: int | None = None,
         max_concurrent_requests: int = 18,
+        *,
+        pin_etag: bool = False,
     ) -> None:
         """
         Create an eager reader that loads the entire file into memory.
@@ -92,6 +97,15 @@ class EagerStoreReader:
             Maximum number of concurrent range requests. Default is 18. If the file
             would require more requests than this, request sizes are increased to
             fit within this limit.
+        pin_etag
+            Send every request with If-Match against the ETag from a HEAD (made
+            even when `file_size` is given), so all bytes come from one revision
+            of the object and a modification mid-download raises the store's
+            precondition error (e.g. `obstore.exceptions.PreconditionError`)
+            instead of mixing revisions. Raises `ValueError` if the store
+            reports no ETag. Parts are then fetched with concurrent
+            [`get()`][obspec.Get] calls, since [`get_ranges()`][obspec.GetRanges]
+            takes no options.
         """
         self._store = store
         self._path = path
@@ -99,7 +113,9 @@ class EagerStoreReader:
         self._e_tag: str | None = None
 
         # Determine file size if not provided
-        if file_size is None:
+        if pin_etag:
+            file_size, self._e_tag = require_e_tag(store, path)
+        elif file_size is None:
             meta = store.head(path)
             file_size = meta["size"]
             self._e_tag = meta.get("e_tag")
@@ -119,7 +135,8 @@ class EagerStoreReader:
 
         # Skip concurrency overhead for single request
         if num_requests == 1:
-            result = store.get(path)
+            options = {"if_match": self._e_tag} if pin_etag else {}
+            result = store.get(path, options=options)  # type: ignore[arg-type]
             data = bytes(result.buffer())
             if self._e_tag is None:
                 self._e_tag = result.meta.get("e_tag")
@@ -134,7 +151,19 @@ class EagerStoreReader:
                 lengths.append(length)
 
             # Fetch all parts with concurrency
-            results = store.get_ranges(path, starts=starts, lengths=lengths)
+            results: Sequence[Any]  # bytes, or the store's Buffer type
+            if pin_etag:
+                assert self._e_tag is not None  # set by require_e_tag()
+                results = get_ranges_if_match(
+                    store,
+                    path,
+                    starts=starts,
+                    lengths=lengths,
+                    e_tag=self._e_tag,
+                    max_workers=num_requests,
+                )
+            else:
+                results = store.get_ranges(path, starts=starts, lengths=lengths)
 
             # Concatenate into single buffer
             data = b"".join(bytes(part) for part in results)
@@ -149,8 +178,8 @@ class EagerStoreReader:
         `None` if the store reports no ETag, or if `file_size` was passed and the
         file was fetched as several range requests (which carry no metadata).
         Never looked up after the fact: an ETag fetched later could describe a
-        newer revision than the bytes already read. Reads are not checked
-        against it.
+        newer revision than the bytes already read. The download is checked
+        against it only with `pin_etag=True`.
         """
         return self._e_tag
 

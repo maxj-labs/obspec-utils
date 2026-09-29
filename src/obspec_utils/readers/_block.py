@@ -5,9 +5,12 @@ from __future__ import annotations
 import io
 import warnings
 from collections import OrderedDict
-from typing import Protocol
+from collections.abc import Sequence
+from typing import Any, Protocol
 
 from obspec import Get, GetRanges, Head
+
+from obspec_utils.readers._if_match import get_ranges_if_match, require_e_tag
 
 
 class BlockStoreReader:
@@ -63,6 +66,8 @@ class BlockStoreReader:
         path: str,
         block_size: int = 1024 * 1024,
         max_cached_blocks: int = 64,
+        *,
+        pin_etag: bool = False,
     ) -> None:
         """
         Create a block-based reader with LRU caching.
@@ -80,6 +85,14 @@ class BlockStoreReader:
         max_cached_blocks
             Maximum number of blocks to keep in the LRU cache. Default is 64,
             giving a 64 MB cache with the default block size.
+        pin_etag
+            Send every read with If-Match against the ETag from the reader's
+            initial HEAD, so all bytes come from one revision of the object and
+            a modification mid-read raises the store's precondition error (e.g.
+            `obstore.exceptions.PreconditionError`) instead of mixing revisions.
+            Raises `ValueError` if the store reports no ETag. Range reads then
+            go through [`get()`][obspec.Get], since
+            [`get_ranges()`][obspec.GetRanges] takes no options.
         """
         self._store = store
         self._path = path
@@ -88,6 +101,7 @@ class BlockStoreReader:
         self._position = 0
         self._size: int | None = None
         self._e_tag: str | None = None
+        self._pin_etag = pin_etag
         self._closed = False
         # LRU cache: OrderedDict with block_index -> bytes
         self._cache: OrderedDict[int, bytes] = OrderedDict()
@@ -95,9 +109,12 @@ class BlockStoreReader:
     def _get_size(self) -> int:
         """Lazily fetch the file size (and ETag) via a head() call."""
         if self._size is None:
-            meta = self._store.head(self._path)
-            self._size = meta["size"]
-            self._e_tag = meta.get("e_tag")
+            if self._pin_etag:
+                self._size, self._e_tag = require_e_tag(self._store, self._path)
+            else:
+                meta = self._store.head(self._path)
+                self._size = meta["size"]
+                self._e_tag = meta.get("e_tag")
         return self._size
 
     @property
@@ -107,8 +124,8 @@ class BlockStoreReader:
 
         `None` until the reader has read something, or if the store reports no
         ETag. Never looked up after the fact: an ETag fetched later could describe
-        a newer revision than the bytes already read. Reads are not checked
-        against it.
+        a newer revision than the bytes already read. Reads are checked against
+        it only with `pin_etag=True`.
         """
         return self._e_tag
 
@@ -130,7 +147,20 @@ class BlockStoreReader:
                 lengths.append(end - start)
 
             # Fetch all blocks with concurrency
-            results = self._store.get_ranges(self._path, starts=starts, lengths=lengths)
+            results: Sequence[Any]  # bytes, or the store's Buffer type
+            if self._pin_etag:
+                assert self._e_tag is not None  # set by _get_size()
+                results = get_ranges_if_match(
+                    self._store,
+                    self._path,
+                    starts=starts,
+                    lengths=lengths,
+                    e_tag=self._e_tag,
+                )
+            else:
+                results = self._store.get_ranges(
+                    self._path, starts=starts, lengths=lengths
+                )
 
             # Store in cache
             for block_idx, data in zip(needed, results):
@@ -211,7 +241,11 @@ class BlockStoreReader:
         bytes
             The complete file contents.
         """
-        result = self._store.get(self._path)
+        if self._pin_etag:
+            self._get_size()
+            result = self._store.get(self._path, options={"if_match": self._e_tag})
+        else:
+            result = self._store.get(self._path)
         data = bytes(result.buffer())
         if self._size is None:
             self._e_tag = result.meta.get("e_tag")
