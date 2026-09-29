@@ -1,6 +1,7 @@
 """Tests for SplittingReadableStore."""
 
 import pytest
+from obstore.exceptions import PreconditionError
 from obstore.store import MemoryStore
 
 from obspec_utils.wrappers import CachingReadableStore, SplittingReadableStore
@@ -86,6 +87,21 @@ class TestSplittingReadableStore:
         # MemoryStore has put/delete methods
         assert hasattr(splitter, "put")
         assert hasattr(splitter, "delete")
+
+    def test_get_with_options_is_passed_through(self):
+        """A range or conditional get() is not split: splitting would return the
+        whole object and drop the options."""
+        source = MemoryStore()
+        source.put("large.bin", b"0123456789" * 100)
+        splitter = SplittingReadableStore(source, request_size=100)
+
+        result = splitter.get("large.bin", options={"range": (5, 10)})
+        assert bytes(result.buffer()) == b"56789"
+
+        e_tag = source.head("large.bin")["e_tag"]
+        assert bytes(splitter.get("large.bin", options={"if_match": e_tag}).buffer())
+        with pytest.raises(PreconditionError):
+            splitter.get("large.bin", options={"if_match": '"other"'})
 
 
 class TestSplittingWithCaching:

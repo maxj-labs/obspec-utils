@@ -193,9 +193,15 @@ class SplittingReadableStore(ReadableStore):
         """Get file, using concurrent fetching if beneficial.
 
         If the file is large enough to benefit from splitting, fetches via
-        concurrent [get_ranges()][obspec.GetRanges]. Otherwise falls back to a single
+        concurrent [get_ranges()][obspec.GetRanges]. Otherwise, or when `options`
+        are given (a range or conditional request), falls back to a single
         [get()][obspec.Get] request.
         """
+        if options:
+            # A range or conditional request is not a full download: pass it
+            # through untouched rather than split it (and drop the options).
+            return self._store.get(path, options=options)
+
         file_size = self.head(path)["size"]
         ranges = self._compute_ranges(file_size)
 
@@ -212,6 +218,9 @@ class SplittingReadableStore(ReadableStore):
         self, path: str, *, options: GetOptions | None = None
     ) -> GetResultAsync:
         """Async get, using concurrent fetching if beneficial."""
+        if options:
+            return await self._store.get_async(path, options=options)
+
         file_size = (await self.head_async(path))["size"]
         ranges = self._compute_ranges(file_size)
 
