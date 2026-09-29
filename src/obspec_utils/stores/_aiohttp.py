@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, TypeVar
 
 from obspec import GetResult, GetResultAsync
+from obspec.exceptions import PreconditionError
 
 from obspec_utils.protocols import ReadableStore
 
@@ -366,7 +367,14 @@ class AiohttpStore(ReadableStore):
                 elif (suffix := range_opt.get("suffix")) is not None:
                     request_headers["Range"] = f"bytes=-{suffix}"
 
+        if options and (if_match := options.get("if_match")) is not None:
+            request_headers["If-Match"] = if_match
+
         async with session.get(url, headers=request_headers) as response:
+            if response.status == 412:
+                raise PreconditionError(
+                    f"If-Match {request_headers['If-Match']!r} failed for {url}"
+                )
             response.raise_for_status()
             data = await response.read()
             meta = self._parse_meta_from_headers(
@@ -398,7 +406,9 @@ class AiohttpStore(ReadableStore):
         path
             Path to the file relative to base_url.
         options
-            Optional get options (range, conditionals, etc.).
+            Optional get options. `range` and `if_match` are honored; other
+            options are ignored. A failed `if_match` raises
+            [PreconditionError][obspec.exceptions.PreconditionError].
 
         Returns
         -------

@@ -4,6 +4,9 @@ import io
 from datetime import datetime
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
+from obspec.exceptions import PreconditionError
 
 from obspec_utils.stores import AiohttpGetResult, AiohttpGetResultAsync, AiohttpStore
 
@@ -735,3 +738,23 @@ async def test_sync_loop_created_inside_async(minio_test_file):
     store.close()
     assert store._sync_loop is None
     assert store._sync_thread is None
+
+
+@pytest.mark.asyncio
+async def test_get_sends_if_match():
+    """`if_match` goes out as If-Match; a 412 becomes PreconditionError."""
+
+    async def handler(request):
+        if request.headers.get("If-Match", '"v1"') != '"v1"':
+            return web.Response(status=412)
+        return web.Response(body=b"hello world", headers={"ETag": '"v1"'})
+
+    app = web.Application()
+    app.router.add_get("/file", handler)
+    async with TestServer(app) as server:
+        store = AiohttpStore(str(server.make_url("/")))
+
+        result = await store.get_async("file", options={"if_match": '"v1"'})
+        assert await result.buffer_async() == b"hello world"
+        with pytest.raises(PreconditionError):
+            await store.get_async("file", options={"if_match": '"v0"'})
