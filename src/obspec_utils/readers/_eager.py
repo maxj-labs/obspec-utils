@@ -96,10 +96,13 @@ class EagerStoreReader:
         self._store = store
         self._path = path
         self._closed = False
+        self._e_tag: str | None = None
 
         # Determine file size if not provided
         if file_size is None:
-            file_size = store.head(path)["size"]
+            meta = store.head(path)
+            file_size = meta["size"]
+            self._e_tag = meta.get("e_tag")
 
         # Handle empty files
         if file_size == 0:
@@ -118,6 +121,8 @@ class EagerStoreReader:
         if num_requests == 1:
             result = store.get(path)
             data = bytes(result.buffer())
+            if self._e_tag is None:
+                self._e_tag = result.meta.get("e_tag")
         else:
             # Concurrent range requests
             starts = []
@@ -135,6 +140,19 @@ class EagerStoreReader:
             data = b"".join(bytes(part) for part in results)
 
         self._buffer = io.BytesIO(data)
+
+    @property
+    def e_tag(self) -> str | None:
+        """
+        The object's ETag, as observed before or with the file's download.
+
+        `None` if the store reports no ETag, or if `file_size` was passed and the
+        file was fetched as several range requests (which carry no metadata).
+        Never looked up after the fact: an ETag fetched later could describe a
+        newer revision than the bytes already read. Reads are not checked
+        against it.
+        """
+        return self._e_tag
 
     def read(self, size: int = -1, /) -> bytes:
         """Read up to `size` bytes from the cached file."""

@@ -87,15 +87,30 @@ class BlockStoreReader:
         self._max_cached_blocks = max_cached_blocks
         self._position = 0
         self._size: int | None = None
+        self._e_tag: str | None = None
         self._closed = False
         # LRU cache: OrderedDict with block_index -> bytes
         self._cache: OrderedDict[int, bytes] = OrderedDict()
 
     def _get_size(self) -> int:
-        """Lazily fetch the file size via a head() call."""
+        """Lazily fetch the file size (and ETag) via a head() call."""
         if self._size is None:
-            self._size = self._store.head(self._path)["size"]
+            meta = self._store.head(self._path)
+            self._size = meta["size"]
+            self._e_tag = meta.get("e_tag")
         return self._size
+
+    @property
+    def e_tag(self) -> str | None:
+        """
+        The object's ETag, as observed before or with the reader's first data read.
+
+        `None` until the reader has read something, or if the store reports no
+        ETag. Never looked up after the fact: an ETag fetched later could describe
+        a newer revision than the bytes already read. Reads are not checked
+        against it.
+        """
+        return self._e_tag
 
     def _get_blocks(self, block_indices: list[int]) -> dict[int, bytes]:
         """Fetch multiple concurrent blocks using get_ranges()."""
@@ -198,6 +213,8 @@ class BlockStoreReader:
         """
         result = self._store.get(self._path)
         data = bytes(result.buffer())
+        if self._size is None:
+            self._e_tag = result.meta.get("e_tag")
         self._size = len(data)
         self._position = len(data)
         return data

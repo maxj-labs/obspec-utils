@@ -17,7 +17,7 @@ from obspec_utils.readers import (
     ParallelStoreReader,
 )
 
-from .mocks import PicklableStore
+from .mocks import MockReadableStore, PicklableStore
 
 
 ALL_READERS = [BufferedStoreReader, EagerStoreReader, BlockStoreReader]
@@ -623,3 +623,64 @@ def test_reader_writable(ReaderClass):
     reader = ReaderClass(memstore, "test.txt")
     assert reader.writable() is False
     reader.close()
+
+
+# =============================================================================
+# ETag
+# =============================================================================
+
+
+@pytest.mark.parametrize("ReaderClass", ALL_READERS)
+def test_reader_e_tag_is_observed_with_the_first_read(ReaderClass):
+    """The ETag matches the revision the reader read, and is never refreshed
+    afterwards: a later lookup could describe bytes the reader never saw."""
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+    original = memstore.head("test.txt")["e_tag"]
+
+    reader = ReaderClass(memstore, "test.txt")
+    reader.read(5)
+    memstore.put("test.txt", b"HELLO WORLD")
+
+    assert reader.e_tag == original
+    reader.close()
+
+
+@pytest.mark.parametrize("ReaderClass", [BufferedStoreReader, BlockStoreReader])
+def test_lazy_reader_e_tag_is_none_before_any_read(ReaderClass):
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+
+    assert ReaderClass(memstore, "test.txt").e_tag is None
+
+
+@pytest.mark.parametrize("ReaderClass", [BufferedStoreReader, BlockStoreReader])
+def test_reader_e_tag_from_readall_without_head(ReaderClass):
+    """readall() is a single GET, so its metadata carries the ETag."""
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+
+    reader = ReaderClass(memstore, "test.txt")
+    reader.readall()
+
+    assert reader.e_tag == memstore.head("test.txt")["e_tag"]
+
+
+def test_eager_reader_e_tag_without_head():
+    """With file_size given there is no HEAD: a single GET still carries the
+    ETag, several range requests do not."""
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"hello world")
+    e_tag = memstore.head("test.txt")["e_tag"]
+
+    assert EagerStoreReader(memstore, "test.txt", file_size=11).e_tag == e_tag
+    split = EagerStoreReader(memstore, "test.txt", request_size=4, file_size=11)
+    assert split.e_tag is None
+
+
+@pytest.mark.parametrize("ReaderClass", ALL_READERS)
+def test_reader_e_tag_none_when_store_reports_none(ReaderClass):
+    reader = ReaderClass(MockReadableStore(b"hello world"), "test.txt")
+    reader.read(5)
+
+    assert reader.e_tag is None
