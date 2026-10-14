@@ -7,7 +7,7 @@ import warnings
 from collections import OrderedDict
 from typing import Protocol
 
-from obspec import Get, GetRanges, Head
+from obspec import Get, GetRange, GetRanges, Head
 
 
 class BlockStoreReader:
@@ -15,7 +15,8 @@ class BlockStoreReader:
     A file-like reader that uses concurrent range requests for efficient block fetching.
 
     This reader divides the file into fixed-size blocks and uses [`get_ranges()`][obspec.GetRanges]
-    to fetch multiple blocks with concurrency. An LRU cache stores recently accessed blocks
+    to fetch multiple blocks with concurrency, or [`get_range()`][obspec.GetRange] when a
+    single block is needed. An LRU cache stores recently accessed blocks
     to avoid redundant fetches.
 
     This is particularly efficient for workloads that access multiple non-contiguous
@@ -47,12 +48,12 @@ class BlockStoreReader:
     - [EagerStoreReader][obspec_utils.readers.EagerStoreReader] : Loads entire file into memory for fast random access.
     """
 
-    class Store(Get, GetRanges, Head, Protocol):
+    class Store(Get, GetRange, GetRanges, Head, Protocol):
         """
         Store protocol required by BlockStoreReader.
 
-        Combines [Get][obspec.Get], [GetRanges][obspec.GetRanges], and
-        [Head][obspec.Head] from obspec.
+        Combines [Get][obspec.Get], [GetRange][obspec.GetRange],
+        [GetRanges][obspec.GetRanges], and [Head][obspec.Head] from obspec.
         """
 
         pass
@@ -70,7 +71,8 @@ class BlockStoreReader:
         Parameters
         ----------
         store
-            Any object implementing [Get][obspec.Get] and [GetRanges][obspec.GetRanges].
+            Any object implementing [Get][obspec.Get], [GetRange][obspec.GetRange],
+            [GetRanges][obspec.GetRanges] and [Head][obspec.Head].
         path
             The path to the file within the store.
         block_size
@@ -114,8 +116,18 @@ class BlockStoreReader:
                 starts.append(start)
                 lengths.append(end - start)
 
-            # Fetch all blocks with concurrency
-            results = self._store.get_ranges(self._path, starts=starts, lengths=lengths)
+            if len(needed) > 1:
+                # Fetch all blocks with concurrency
+                results = self._store.get_ranges(
+                    self._path, starts=starts, lengths=lengths
+                )
+            else:
+                # Single block: a plain get_range is cheaper on local stores.
+                results = [
+                    self._store.get_range(
+                        self._path, start=starts[0], length=lengths[0]
+                    )
+                ]
 
             # Store in cache
             for block_idx, data in zip(needed, results):
@@ -299,7 +311,8 @@ class ParallelStoreReader(BlockStoreReader):
         Parameters
         ----------
         store
-            Any object implementing [Get][obspec.Get] and [GetRanges][obspec.GetRanges].
+            Any object implementing [Get][obspec.Get], [GetRange][obspec.GetRange],
+            [GetRanges][obspec.GetRanges] and [Head][obspec.Head].
         path
             The path to the file within the store.
         chunk_size

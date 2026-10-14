@@ -254,3 +254,23 @@ def test_block_reader_cache_cleared_on_close():
 
     reader.close()
     assert len(reader._cache) == 0
+
+
+def test_block_reader_single_block_uses_get_range():
+    """One missing block goes through get_range; several go through get_ranges."""
+    memstore = MemoryStore()
+    memstore.put("test.txt", b"0123456789ABCDEF")
+
+    trace = RequestTrace()
+    traced = TracingReadableStore(memstore, trace)
+    reader = BlockStoreReader(traced, "test.txt", block_size=4, max_cached_blocks=4)
+
+    assert reader.read(4) == b"0123"
+    assert [r.method for r in trace.requests] == ["head", "get_range"]
+    assert trace.requests[1].start == 0
+    assert trace.requests[1].length == 4
+
+    trace.clear()
+    assert reader.read(8) == b"456789AB"
+    # the tracing wrapper records one entry per range
+    assert [r.method for r in trace.requests] == ["get_ranges", "get_ranges"]
